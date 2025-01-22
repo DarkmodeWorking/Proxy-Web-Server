@@ -1,603 +1,185 @@
 /*
-  proxy_parse.c -- a HTTP Request Parsing Library.
-  COS 461  
-*/
-
-#include "proxy_parse.h"
-
-#define DEFAULT_NHDRS 8
-#define MAX_REQ_LEN 65535
-#define MIN_REQ_LEN 4
-
-static const char *root_abs_path = "/";
-
-/* private function declartions */
-int ParsedRequest_printRequestLine(struct ParsedRequest *pr, 
-				   char * buf, size_t buflen,
-				   size_t *tmp);
-size_t ParsedRequest_requestLineLen(struct ParsedRequest *pr);
-
-/*
- * debug() prints out debugging info if DEBUG is set to 1
+ * proxy_parse.h -- a HTTP Request Parsing Library.
  *
- * parameter format: same as printf 
- *
- */
-void debug(const char * format, ...) {
-     va_list args;
-     if (DEBUG) {
-	  va_start(args, format);
-	  vfprintf(stderr, format, args);
-	  va_end(args);
-     }
-}
-
-
-/*
- *  ParsedHeader Public Methods
- */
-
-/* Set a header with key and value */
-int ParsedHeader_set(struct ParsedRequest *pr, 
-		     const char * key, const char * value)
-{
-     struct ParsedHeader *ph;
-     ParsedHeader_remove (pr, key);
-
-     if (pr->headerslen <= pr->headersused+1) {
-	  pr->headerslen = pr->headerslen * 2;
-	  pr->headers = 
-	       (struct ParsedHeader *)realloc(pr->headers, 
-		pr->headerslen * sizeof(struct ParsedHeader));
-	  if (!pr->headers)
-	       return -1;
-     }
-
-     ph = pr->headers + pr->headersused;
-     pr->headersused += 1;
-     
-     ph->key = (char *)malloc(strlen(key)+1);
-     memcpy(ph->key, key, strlen(key));
-     ph->key[strlen(key)] = '\0';
-
-     ph->value = (char *)malloc(strlen(value)+1);
-     memcpy(ph->value, value, strlen(value));
-     ph->value[strlen(value)] = '\0';
-
-     ph->keylen = strlen(key)+1;
-     ph->valuelen = strlen(value)+1;
-     return 0;
-}
-
-
-/* get the parsedHeader with the specified key or NULL */
-struct ParsedHeader* ParsedHeader_get(struct ParsedRequest *pr, 
-				      const char * key)
-{
-     size_t i = 0;
-     struct ParsedHeader * tmp;
-     while(pr->headersused > i)
-     {
-	  tmp = pr->headers + i;
-	  if(tmp->key && key && strcmp(tmp->key, key) == 0)
-	  {
-	       return tmp;
-	  }
-	  i++;
-     }
-     return NULL;
-}
-
-/* remove the specified key from parsedHeader */
-int ParsedHeader_remove(struct ParsedRequest *pr, const char *key)
-{
-     struct ParsedHeader *tmp;
-     tmp = ParsedHeader_get(pr, key);
-     if(tmp == NULL)
-	  return -1;
-
-     free(tmp->key);
-     free(tmp->value);
-     tmp->key = NULL;
-     return 0;
-}
-
-
-/* modify the header with given key, giving it a new value
- * return 1 on success and 0 if no such header found
+ * Written by: Matvey Arye
+ * For: COS 518 
  * 
-int ParsedHeader_modify(struct ParsedRequest *pr, const char * key, 
-			const char *newValue)
-{
-     struct ParsedHeader *tmp;
-     tmp = ParsedHeader_get(pr, key);
-     if(tmp != NULL)
-     {
-	  if(tmp->valuelen < strlen(newValue)+1)
-	  {
-	       tmp->valuelen = strlen(newValue)+1;
-	       tmp->value = (char *) realloc(tmp->value, 
-					     tmp->valuelen * sizeof(char));
-	  } 
-	  strcpy(tmp->value, newValue);
-	  return 1;
-     }
-     return 0;
-}
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdarg.h>
+#include <errno.h>
+
+#include <ctype.h>
+
+#ifndef PROXY_PARSE
+#define PROXY_PARSE
+
+#define DEBUG 1
+
+/* 
+   ParsedRequest objects are created from parsing a buffer containing a HTTP
+   request. The request buffer consists of a request line followed by a number
+   of headers. Request line fields such as method, protocol etc. are stored
+   explicitly. Headers such as 'Content-Length' and their values are maintained
+   in a linked list. Each node in this list is a ParsedHeader and contains a
+   key-value pair.
+
+   The buf and buflen fields are used internally to maintain the parsed request
+   line.
+ */
+struct ParsedRequest {
+     char *method; 
+     char *protocol; 
+     char *host; 
+     char *port; 
+     char *path;
+     char *version;
+     char *buf;
+     size_t buflen;
+     struct ParsedHeader *headers;
+     size_t headersused;
+     size_t headerslen;
+};
+
+/* 
+   ParsedHeader: any header after the request line is a key-value pair with the
+   format "key:value\r\n" and is maintained in the ParsedHeader linked list
+   within ParsedRequest
 */
-
-/*
-  ParsedHeader Private Methods
-*/
-
-void ParsedHeader_create(struct ParsedRequest *pr)
-{
-     pr->headers = 
-     (struct ParsedHeader *)malloc(sizeof(struct ParsedHeader)*DEFAULT_NHDRS);
-     pr->headerslen = DEFAULT_NHDRS;
-     pr->headersused = 0;
-} 
-
-
-size_t ParsedHeader_lineLen(struct ParsedHeader * ph)
-{
-     if(ph->key != NULL)
-     {
-	  return strlen(ph->key)+strlen(ph->value)+4;
-     }
-     return 0; 
-}
-
-size_t ParsedHeader_headersLen(struct ParsedRequest *pr) 
-{
-     if (!pr || !pr->buf)
-	  return 0;
-
-     size_t i = 0;
-     int len = 0;
-     while(pr->headersused > i)
-     {
-	  len += ParsedHeader_lineLen(pr->headers + i);
-	  i++;
-     }
-     len += 2;
-     return len;
-}
-
-int ParsedHeader_printHeaders(struct ParsedRequest * pr, char * buf, 
-			      size_t len)
-{
-     char * current = buf;
-     struct ParsedHeader * ph;
-     size_t i = 0;
-
-     if(len < ParsedHeader_headersLen(pr))
-     {
-	  debug("buffer for printing headers too small\n");
-	  return -1;
-     }
-  
-     while(pr->headersused > i)
-     {
-	  ph = pr->headers+i;
-	  if (ph->key) {
-	       memcpy(current, ph->key, strlen(ph->key));
-	       memcpy(current+strlen(ph->key), ": ", 2);
-	       memcpy(current+strlen(ph->key) +2 , ph->value, 
-		      strlen(ph->value));
-	       memcpy(current+strlen(ph->key) +2+strlen(ph->value) , 
-		      "\r\n", 2);
-	       current += strlen(ph->key)+strlen(ph->value)+4;
-	  }
-	  i++;
-     }
-     memcpy(current, "\r\n",2);
-     return 0;
-}
-
-
-void ParsedHeader_destroyOne(struct ParsedHeader * ph)
-{
-     if(ph->key != NULL)
-     {
-	  free(ph->key);
-	  ph->key = NULL;
-	  free(ph->value);
-	  ph->value = NULL;
-	  ph->keylen = 0;
-	  ph->valuelen = 0;
-     }
-}
-
-void ParsedHeader_destroy(struct ParsedRequest * pr)
-{
-     size_t i = 0;
-     while(pr->headersused > i)
-     {
-	  ParsedHeader_destroyOne(pr->headers + i);
-	  i++;
-     }
-     pr->headersused = 0;
-
-     free(pr->headers);
-     pr->headerslen = 0;
-}
-
-
-int ParsedHeader_parse(struct ParsedRequest * pr, char * line)
-{
+struct ParsedHeader {
      char * key;
+     size_t keylen;
      char * value;
-     char * index1;
-     char * index2;
+     size_t valuelen;
+};
 
-     index1 = index(line, ':');
-     if(index1 == NULL)
-     {
-	  debug("No colon found\n");
-	  return -1;
-     }
-     key = (char *)malloc((index1-line+1)*sizeof(char));
-     memcpy(key, line, index1-line);
-     key[index1-line]='\0';
 
-     index1 += 2;
-     index2 = strstr(index1, "\r\n");
-     value = (char *) malloc((index2-index1+1)*sizeof(char));
-     memcpy(value, index1, (index2-index1));
-     value[index2-index1] = '\0';
+/* Create an empty parsing object to be used exactly once for parsing a single
+ * request buffer */
+struct ParsedRequest* ParsedRequest_create();
 
-     ParsedHeader_set(pr, key, value);
-     free(key);
-     free(value);
-     return 0;
-}
+/* Parse the request buffer in buf given that buf is of length buflen */
+int ParsedRequest_parse(struct ParsedRequest * parse, const char *buf,
+			int buflen);
 
-/*
-  ParsedRequest Public Methods
-*/
-
-void ParsedRequest_destroy(struct ParsedRequest *pr)
-{
-     if(pr->buf != NULL)
-     {
-	  free(pr->buf);
-     }
-     if (pr->path != NULL) {
-	  free(pr->path);
-     }
-     if(pr->headerslen > 0)
-     {
-	  ParsedHeader_destroy(pr);
-     }
-     free(pr);
-}
-
-struct ParsedRequest* ParsedRequest_create()
-{
-     struct ParsedRequest *pr;
-     pr = (struct ParsedRequest *)malloc(sizeof(struct ParsedRequest));
-     if (pr != NULL)
-     {
-	  ParsedHeader_create(pr);
-	  pr->buf = NULL;
-	  pr->method = NULL;
-	  pr->protocol = NULL;
-	  pr->host = NULL;
-	  pr->path = NULL;
-	  pr->version = NULL;
-	  pr->buf = NULL;
-	  pr->buflen = 0;
-     }
-     return pr;
-}
+/* Destroy the parsing object. */
+void ParsedRequest_destroy(struct ParsedRequest *pr);
 
 /* 
-   Recreate the entire buffer from a parsed request object.
-   buf must be allocated
-*/
+   Retrieve the entire buffer from a parsed request object. buf must be an
+   allocated buffer of size buflen, with enough space to write the request
+   line, headers and the trailing \r\n. buf will not be NUL terminated by
+   unparse().
+ */
 int ParsedRequest_unparse(struct ParsedRequest *pr, char *buf, 
-			  size_t buflen)
-{
-     if (!pr || !pr->buf)
-	  return -1;
-
-     size_t tmp;
-     if (ParsedRequest_printRequestLine(pr, buf, buflen, &tmp) < 0)
-	  return -1;
-     if (ParsedHeader_printHeaders(pr, buf+tmp, buflen-tmp) < 0)
-	  return -1;
-     return 0;
-}
+			  size_t buflen);
 
 /* 
-   Recreate the headers from a parsed request object.
-   buf must be allocated
-*/
+   Retrieve the entire buffer with the exception of request line from a parsed
+   request object. buf must be an allocated buffer of size buflen, with enough
+   space to write the headers and the trailing \r\n. buf will not be NUL
+   terminated by unparse(). If there are no headers, the trailing \r\n is
+   unparsed.
+ */
 int ParsedRequest_unparse_headers(struct ParsedRequest *pr, char *buf, 
-				  size_t buflen)
-{
-     if (!pr || !pr->buf)
-	  return -1;
+				  size_t buflen);
 
-     if (ParsedHeader_printHeaders(pr, buf, buflen) < 0)
-	  return -1;
-     return 0;
-}
+/* Total length including request line, headers and the trailing \r\n*/
+size_t ParsedRequest_totalLen(struct ParsedRequest *pr);
 
+/* Length including headers, if any, and the trailing \r\n but excluding the
+ * request line. 
+ */
+size_t ParsedHeader_headersLen(struct ParsedRequest *pr);
 
-/* Size of the headers if unparsed into a string */
-size_t ParsedRequest_totalLen(struct ParsedRequest *pr)
-{
-     if (!pr || !pr->buf)
-	  return 0;
-     return ParsedRequest_requestLineLen(pr)+ParsedHeader_headersLen(pr);
-}
+/* Set, get, and remove null-terminated header keys and values */
+int ParsedHeader_set(struct ParsedRequest *pr, const char * key, 
+		      const char * value);
+struct ParsedHeader* ParsedHeader_get(struct ParsedRequest *pr, 
+				      const char * key);
+int ParsedHeader_remove (struct ParsedRequest *pr, const char * key);
 
+/* debug() prints out debugging info if DEBUG is set to 1 */
+void debug(const char * format, ...);
 
-/* 
-   Parse request buffer
- 
-   Parameters: 
-   parse: ptr to a newly created ParsedRequest object
-   buf: ptr to the buffer containing the request (need not be NUL terminated)
-   and the trailing \r\n\r\n
-   buflen: length of the buffer including the trailing \r\n\r\n
+/* Example usage:
+
+   const char *c = 
+   "GET http://www.google.com:80/index.html/ HTTP/1.0\r\nContent-Length:"
+   " 80\r\nIf-Modified-Since: Sat, 29 Oct 1994 19:43:31 GMT\r\n\r\n";
    
-   Return values:
-   -1: failure
-   0: success
-*/
-int 
-ParsedRequest_parse(struct ParsedRequest * parse, const char *buf, 
-		    int buflen)
-{
-     char *full_addr;
-     char *saveptr;
-     char *index;
-     char *currentHeader;
+   int len = strlen(c); 
+   //Create a ParsedRequest to use. This ParsedRequest
+   //is dynamically allocated.
+   ParsedRequest *req = ParsedRequest_create();
+   if (ParsedRequest_parse(req, c, len) < 0) {
+       printf("parse failed\n");
+       return -1;
+   }
 
-     if (parse->buf != NULL) {
-	  debug("parse object already assigned to a request\n");
-	  return -1;
-     }
+   printf("Method:%s\n", req->method);
+   printf("Host:%s\n", req->host);
+
+   // Turn ParsedRequest into a string. 
+   // Friendly reminder: Be sure that you need to
+   // dynamically allocate string and if you
+   // do, remember to free it when you are done.
+   // (Dynamic allocation wasn't necessary here,
+   // but it was used as an example.)
+   int rlen = ParsedRequest_totalLen(req);
+   char *b = (char *)malloc(rlen+1);
+   if (ParsedRequest_unparse(req, b, rlen) < 0) {
+      printf("unparse failed\n");
+      return -1;
+   }
+   b[rlen]='\0';
+   // print out b for text request 
+   free(b);
+  
+
+   // Turn the headers from the request into a string.
+   rlen = ParsedHeader_headersLen(req);
+   char buf[rlen+1];
+   if (ParsedRequest_unparse_headers(req, buf, rlen) < 0) {
+      printf("unparse failed\n");
+      return -1;
+   }
+   buf[rlen] ='\0';
+   //print out buf for text headers only 
+
+   // Get a specific header (key) from the headers. A key is a header field 
+   // such as "If-Modified-Since" which is followed by ":"
+   struct ParsedHeader *r = ParsedHeader_get(req, "If-Modified-Since");
+   printf("Modified value: %s\n", r->value);
    
-     if (buflen < MIN_REQ_LEN || buflen > MAX_REQ_LEN) {
-	  debug("invalid buflen %d", buflen);
-	  return -1;
-     }
+   // Remove a specific header by name. In this case remove
+   // the "If-Modified-Since" header. 
+   if (ParsedHeader_remove(req, "If-Modified-Since") < 0){
+      printf("remove header key not work\n");
+     return -1;
+   }
+
+   // Set a specific header (key) to a value. In this case,
+   //we set the "Last-Modified" key to be set to have as 
+   //value  a date in February 2014 
    
-     /* Create NUL terminated tmp buffer */
-     char *tmp_buf = (char *)malloc(buflen + 1); /* including NUL */
-     memcpy(tmp_buf, buf, buflen);
-     tmp_buf[buflen] = '\0';
-   
-     index = strstr(tmp_buf, "\r\n\r\n");
-     if (index == NULL) {
-	  debug("invalid request line, no end of header\n");
-	  free(tmp_buf);
-	  return -1;
-     }
-   
-     /* Copy request line into parse->buf */
-     index = strstr(tmp_buf, "\r\n");
-     if (parse->buf == NULL) {
-	  parse->buf = (char *) malloc((index-tmp_buf)+1);
-	  parse->buflen = (index-tmp_buf)+1;
-     }
-     memcpy(parse->buf, tmp_buf, index-tmp_buf);
-     parse->buf[index-tmp_buf] = '\0';
+    if (ParsedHeader_set(req, "Last-Modified", " Wed, 12 Feb 2014 12:43:31 GMT") < 0){
+     printf("set header key not work\n");
+     return -1;
 
-     /* Parse request line */
-     parse->method = strtok_r(parse->buf, " ", &saveptr);
-     if (parse->method == NULL) {
-	  debug( "invalid request line, no whitespace\n");
-	  free(tmp_buf);
-	  free(parse->buf);
-	  parse->buf = NULL;
-	  return -1;
-     }
-     if (strcmp (parse->method, "GET")) {
-	  debug( "invalid request line, method not 'GET': %s\n", 
-		 parse->method);
-	  free(tmp_buf);
-	  free(parse->buf);
-	  parse->buf = NULL;
-	  return -1;
-     }
+    }
 
-     full_addr = strtok_r(NULL, " ", &saveptr);
+   // Check the modified Header key value pair
+    r = ParsedHeader_get(req, "Last-Modified");
+    printf("Last-Modified value: %s\n", r->value);
 
-     if (full_addr == NULL) {
-	  debug( "invalid request line, no full address\n");
-	  free(tmp_buf);
-	  free(parse->buf);
-	  parse->buf = NULL;
-	  return -1;
-     }
-
-     parse->version = full_addr + strlen(full_addr) + 1;
-
-     if (parse->version == NULL) {
-	  debug( "invalid request line, missing version\n");
-	  free(tmp_buf);
-	  free(parse->buf);
-	  parse->buf = NULL;
-	  return -1;
-     }
-     if (strncmp (parse->version, "HTTP/", 5)) {
-	  debug( "invalid request line, unsupported version %s\n", 
-		 parse->version);
-	  free(tmp_buf);
-	  free(parse->buf);
-	  parse->buf = NULL;
-	  return -1;
-     }
-
-
-     parse->protocol = strtok_r(full_addr, "://", &saveptr);
-     if (parse->protocol == NULL) {
-	  debug( "invalid request line, missing host\n");
-	  free(tmp_buf);
-	  free(parse->buf);
-	  parse->buf = NULL;
-	  return -1;
-     }
-     
-     const char *rem = full_addr + strlen(parse->protocol) + strlen("://");
-     size_t abs_uri_len = strlen(rem);
-
-     parse->host = strtok_r(NULL, "/", &saveptr);
-     if (parse->host == NULL) {
-	  debug( "invalid request line, missing host\n");
-	  free(tmp_buf);
-	  free(parse->buf);
-	  parse->buf = NULL;
-	  return -1;
-     }
-     
-     if (strlen(parse->host) == abs_uri_len) {
-	  debug("invalid request line, missing absolute path\n");
-	  free(tmp_buf);
-	  free(parse->buf);
-	  parse->buf = NULL;
-	  return -1;
-     }
-
-     parse->path = strtok_r(NULL, " ", &saveptr);
-     if (parse->path == NULL) {          // replace empty abs_path with "/"
-	  int rlen = strlen(root_abs_path);
-	  parse->path = (char *)malloc(rlen + 1);
-	  strncpy(parse->path, root_abs_path, rlen + 1);
-     } else if (strncmp(parse->path, root_abs_path, strlen(root_abs_path)) == 0) {
-	  debug("invalid request line, path cannot begin "
-		"with two slash characters\n");
-	  free(tmp_buf);
-	  free(parse->buf);
-	  parse->buf = NULL;
-	  parse->path = NULL;
-	  return -1;
-     } else {
-	  // copy parse->path, prefix with a slash
-	  char *tmp_path = parse->path;
-	  int rlen = strlen(root_abs_path);
-	  int plen = strlen(parse->path);
-	  parse->path = (char *)malloc(rlen + plen + 1);
-	  strncpy(parse->path, root_abs_path, rlen);
-	  strncpy(parse->path + rlen, tmp_path, plen + 1);
-     }
-
-     parse->host = strtok_r(parse->host, ":", &saveptr);
-     parse->port = strtok_r(NULL, "/", &saveptr);
-
-     if (parse->host == NULL) {
-	  debug( "invalid request line, missing host\n");
-	  free(tmp_buf);
-	  free(parse->buf);
-	  free(parse->path);
-	  parse->buf = NULL;
-	  parse->path = NULL;
-	  return -1;
-     }
-
-     if (parse->port != NULL) {
-	  int port = strtol (parse->port, (char **)NULL, 10);
-	  if (port == 0 && errno == EINVAL) {
-	       debug("invalid request line, bad port: %s\n", parse->port);
-	       free(tmp_buf);
-	       free(parse->buf);
-	       free(parse->path);
-	       parse->buf = NULL;
-	       parse->path = NULL;
-	       return -1;
-	  }
-     }
-
-   
-     /* Parse headers */
-     int ret = 0;
-     currentHeader = strstr(tmp_buf, "\r\n")+2;
-     while (currentHeader[0] != '\0' && 
-	    !(currentHeader[0] == '\r' && currentHeader[1] == '\n')) {
-	  
-	  //debug("line %s %s", parse->version, currentHeader);
-
-	  if (ParsedHeader_parse(parse, currentHeader)) {
-	       ret = -1;
-	       break;
-	  }
-
-	  currentHeader = strstr(currentHeader, "\r\n");
-	  if (currentHeader == NULL || strlen (currentHeader) < 2)
-	       break;
-
-	  currentHeader += 2;
-     }
-     free(tmp_buf);
-     return ret;
-}
-
-/* 
-   ParsedRequest Private Methods
+   // Call destroy on any ParsedRequests that you
+   // create once you are done using them. This will
+   // free memory dynamically allocated by the proxy_parse library. 
+   ParsedRequest_destroy(req);
 */
 
-size_t ParsedRequest_requestLineLen(struct ParsedRequest *pr)
-{
-     if (!pr || !pr->buf)
-	  return 0;
-
-     size_t len =  
-	  strlen(pr->method) + 1 + strlen(pr->protocol) + 3 + 
-	  strlen(pr->host) + 1 + strlen(pr->version) + 2;
-     if(pr->port != NULL)
-     {
-	  len += strlen(pr->port)+1;
-     }
-     /* path is at least a slash */
-     len += strlen(pr->path);
-     return len;
-}
-
-int ParsedRequest_printRequestLine(struct ParsedRequest *pr, 
-				   char * buf, size_t buflen,
-				   size_t *tmp)
-{
-     char * current = buf;
-
-     if(buflen <  ParsedRequest_requestLineLen(pr))
-     {
-	  debug("not enough memory for first line\n");
-	  return -1; 
-     }
-     memcpy(current, pr->method, strlen(pr->method));
-     current += strlen(pr->method);
-     current[0]  = ' ';
-     current += 1;
-
-     memcpy(current, pr->protocol, strlen(pr->protocol));
-     current += strlen(pr->protocol);
-     memcpy(current, "://", 3);
-     current += 3;
-     memcpy(current, pr->host, strlen(pr->host));
-     current += strlen(pr->host);
-     if(pr->port != NULL)
-     {
-	  current[0] = ':';
-	  current += 1;
-	  memcpy(current, pr->port, strlen(pr->port));
-	  current += strlen(pr->port);
-     }
-     /* path is at least a slash */
-     memcpy(current, pr->path, strlen(pr->path));
-     current += strlen(pr->path);
-
-     current[0] = ' ';
-     current += 1;
-
-     memcpy(current, pr->version, strlen(pr->version));
-     current += strlen(pr->version);
-     memcpy(current, "\r\n", 2);
-     current +=2;
-     *tmp = current-buf;
-     return 0;
-}
+#endif
