@@ -40,6 +40,10 @@ pthread_mutex_t lock;
 cache_element* head;
 int cache_size;
 
+void *thread_fn(void *socketNew) {
+     
+}
+
 int main(int argc, char* argv[]) {
     int client_socketId, client_len;
     struct sockaddr_in server_addr, client_addr;
@@ -75,13 +79,37 @@ int main(int argc, char* argv[]) {
         perror("Port not available\n");
         exit(1);
     }
+
     printf("Binding on Port %d\n", port_number);
     int listen_status = listen(proxy_socketId, MAX_CLIENTS);
     if (listen_status < 0) {
         perror("Error in listening\n");
         exit(1);
     }
+
     int i = 0;
     int Connected_socketId[MAX_CLIENTS];
     
+    while(1) {
+        bzero((char *)&client_addr, sizeof(client_addr));
+        client_len = sizeof(client_addr);
+        client_socketId = accept(proxy_socketId, (struct sockaddr*)&client_addr, (socklen_t*)&client_len);
+        if(client_socketId < 0) {
+            printf("Not able to connect\n");
+            exit(1);
+        }
+        else {
+            Connected_socketId[i] = client_socketId;
+        }
+        struct sockaddr_in * client_pt = (struct sockaddr_in *)&client_addr;
+        struct in_addr ip_addr = client_pt->sin_addr;
+        char str[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &ip_addr, str, INET_ADDRSTRLEN); 
+        printf("Client is connected with Port Number %d and IP Address is %s\n", ntohs(client_addr.sin_port), str);
+
+        pthread_create(&tid[i], NULL, thread_fn, (void *)&Connected_socketId[i]);
+        i++;
+    } 
+    close(proxy_socketId);
+    return 0;    
 } 
